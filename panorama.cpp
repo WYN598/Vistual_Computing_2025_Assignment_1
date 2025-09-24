@@ -377,7 +377,7 @@ int main(int argc, char** argv) {
             }
         }
 
-        std::cout << "Done. Results saved under: " << out_root << std::endl;
+        std::cout << "ALL Done. Results saved under: " << out_root << std::endl;
         return 0;
     }
     catch (const std::exception& e) {
