@@ -1,500 +1,372 @@
 #include <opencv2/opencv.hpp>
-#include <opencv2/features2d.hpp>
-#include <opencv2/imgproc.hpp>
-#include <opencv2/highgui.hpp>
-#include <filesystem>
 #include <iostream>
+#include <filesystem>
 #include <fstream>
-#include <chrono>
 #include <numeric>
-#include <algorithm>
-#include <string>
-#include <vector>
+#include <chrono>
 
 namespace fs = std::filesystem;
-using namespace cv;
-using std::cerr;
-using std::cout;
-using std::endl;
-using std::string;
-using std::vector;
+using Clock = std::chrono::high_resolution_clock;
 
-// ----------------------------- Config -----------------------------
-struct Config {
-    string dir;                // images directory
-    string outdir = "output";  // output root
-    string detector = "orb";   // orb | akaze
-    string blend = "feather";  // overlay | feather
-    double ransac_thresh = 3.0;
-    bool ratio_test = true;    // Lowe's ratio test
-    double ratio = 0.75;       // ratio value
-    bool cross_check = false;  // BFMatcher crossCheck
-    int hist_bins = 30;
-    bool draw_debug = true;    // save debug images
-};
-
-// ----------------------------- Utils -----------------------------
-static inline bool hasImageExt(const fs::path& p) {
-    auto ext = p.extension().string();
-    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-    return ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".bmp" || ext == ".tif" || ext == ".tiff";
+// ---------- Utility: ensure directory exists ----------
+static void ensure_dir(const fs::path & p) {
+    std::error_code ec; fs::create_directories(p, ec);
 }
 
-vector<Mat> loadImagesSorted(const string& dir) {
-    vector<fs::path> files;
-    for (auto& e : fs::directory_iterator(dir)) {
-        if (!e.is_regular_file()) continue;
-        if (hasImageExt(e.path())) files.push_back(e.path());
-    }
-    std::sort(files.begin(), files.end());
-    vector<Mat> imgs;
-    for (auto& p : files) {
-        Mat im = imread(p.string(), IMREAD_COLOR);
-        if (im.empty()) {
-            cerr << "Failed to read image: " << p << endl;
-            continue;
-        }
-        imgs.push_back(im);
-    }
-    return imgs;
-}
-
-void ensureDir(const string& d) {
-    fs::create_directories(d);
-}
-
-string timeNowStr() {
-    auto t = std::time(nullptr);
-    std::tm tm{};
-#ifdef _WIN32
-    localtime_s(&tm, &t);
-#else
-    localtime_r(&t, &tm);
-#endif
-    char buf[64];
-    std::strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", &tm);
-    return string(buf);
-}
-
-void saveCSVHeader(const string& csv) {
-    if (fs::exists(csv)) return;
-    std::ofstream ofs(csv);
-    ofs << "set,step,detector,kp1,kp2,matches,good_matches,inliers,ransac_thresh,match_time_ms,homog_time_ms,warp_time_ms,blend,blend_time_ms\n";
-}
-
-void appendCSV(const string& csv, const string& setname, const string& step,
-    const string& detector, int kp1, int kp2, int matches, int good_matches,
-    int inliers, double ransac_thresh, double match_ms, double H_ms,
-    double warp_ms, const string& blend, double blend_ms) {
-    std::ofstream ofs(csv, std::ios::app);
-    ofs << setname << "," << step << "," << detector << ","
-        << kp1 << "," << kp2 << "," << matches << "," << good_matches << ","
-        << inliers << "," << ransac_thresh << ","
-        << match_ms << "," << H_ms << "," << warp_ms << ","
-        << blend << "," << blend_ms << "\n";
-}
-
-// Draw a simple histogram image for match distances
-void saveHistogram(const vector<float>& vals, int bins, const string& outpath, const string& title = "Distance Histogram") {
-    if (vals.empty()) return;
-    float vmin = *std::min_element(vals.begin(), vals.end());
-    float vmax = *std::max_element(vals.begin(), vals.end());
-    if (vmax <= vmin) vmax = vmin + 1.f;
-
-    vector<int> hist(bins, 0);
-    for (auto v : vals) {
-        int bi = (int)((v - vmin) / (vmax - vmin) * bins);
-        if (bi == bins) bi = bins - 1;
-        hist[bi]++;
-    }
-    int W = 800, H = 400, margin = 40;
-    Mat canvas(H, W, CV_8UC3, Scalar(255, 255, 255));
-
-    int maxCount = *std::max_element(hist.begin(), hist.end());
-    double xstep = (W - 2 * margin) / double(bins);
-    for (int i = 0; i < bins; ++i) {
-        int h = (int)((H - 2 * margin) * (hist[i] / (double)maxCount));
-        rectangle(canvas,
-            Point((int)(margin + i * xstep), H - margin - h),
-            Point((int)(margin + (i + 1) * xstep - 2), H - margin),
-            Scalar(80, 120, 220), FILLED);
-    }
-    // axes
-    line(canvas, Point(margin, H - margin), Point(W - margin, H - margin), Scalar(0, 0, 0), 2);
-    line(canvas, Point(margin, H - margin), Point(margin, margin), Scalar(0, 0, 0), 2);
-
-    putText(canvas, title, Point(20, 30), FONT_HERSHEY_SIMPLEX, 0.8, Scalar(0, 0, 0), 2);
-    char rng[128]; std::snprintf(rng, sizeof(rng), "min=%.2f max=%.2f", vmin, vmax);
-    putText(canvas, rng, Point(20, 55), FONT_HERSHEY_SIMPLEX, 0.6, Scalar(60, 60, 60), 1);
-
-    imwrite(outpath, canvas);
-}
-
-// ---------------------- Features & Matching -----------------------
-Ptr<Feature2D> makeDetector(const string& name) {
-    string n = name;
-    std::transform(n.begin(), n.end(), n.begin(), ::tolower);
-    if (n == "orb") {
-        return ORB::create(3000); // enough for panoramas
-    }
-    else if (n == "akaze") {
-        return AKAZE::create();   // binary MLDB descriptor by default
-    }
-    else {
-        cerr << "Unknown detector: " << name << " (fallback to ORB)\n";
-        return ORB::create(3000);
-    }
-}
-
-int normTypeFor(const string& detector) {
-
-    return NORM_HAMMING;
-}
-
-struct MatchResult {
-    vector<KeyPoint> k1, k2;
-    Mat d1, d2;
-    vector<DMatch> matches_all;
-    vector<DMatch> good;      // after ratio/cross-check
-    vector<float> distances;  // all distances for histogram
-};
-
-MatchResult detectAndMatch(const Mat& im1, const Mat& im2, const Config& cfg, double& match_ms, const string& debugDir, const string& prefix) {
-    TickMeter tm; tm.start();
-    auto detector = makeDetector(cfg.detector);
-    MatchResult R;
-
-    detector->detectAndCompute(im1, noArray(), R.k1, R.d1);
-    detector->detectAndCompute(im2, noArray(), R.k2, R.d2);
-
-    tm.stop();
-    double feat_ms = tm.getTimeMilli();
-
-    int normType = normTypeFor(cfg.detector);
-
-    tm.reset(); tm.start();
-    if (cfg.ratio_test) {
-        // KNN + ratio
-        BFMatcher matcher(normType, false);
-        vector<vector<DMatch>> knn;
-        matcher.knnMatch(R.d1, R.d2, knn, 2);
-        for (auto& v : knn) {
-            if (v.size() >= 2) {
-                if (v[0].distance < cfg.ratio * v[1].distance) {
-                    R.good.push_back(v[0]);
-                }
-                R.matches_all.push_back(v[0]); // for dist histogram
-                R.distances.push_back(v[0].distance);
-            }
-            else if (!v.empty()) {
-                R.matches_all.push_back(v[0]);
-                R.distances.push_back(v[0].distance);
-            }
-        }
-    }
-    else if (cfg.cross_check) {
-        BFMatcher matcher(normType, true);
-        matcher.match(R.d1, R.d2, R.good);
-        R.matches_all = R.good;
-        for (const auto& m : R.matches_all) R.distances.push_back(m.distance);
-    }
-    else {
-        BFMatcher matcher(normType, false);
-        matcher.match(R.d1, R.d2, R.matches_all);
-        // take top X% as "good"
-        std::sort(R.matches_all.begin(), R.matches_all.end(), [](const DMatch& a, const DMatch& b) {return a.distance < b.distance;});
-        int keep = (int)std::ceil(R.matches_all.size() * 0.5);
-        keep = std::max(keep, std::min(1000, (int)R.matches_all.size()));
-        R.good.assign(R.matches_all.begin(), R.matches_all.begin() + keep);
-        for (const auto& m : R.matches_all) R.distances.push_back(m.distance);
-    }
-    tm.stop();
-    match_ms = tm.getTimeMilli();
-
-    if (cfg.draw_debug) {
-        ensureDir(debugDir);
-        // keypoints
-        Mat im1kp, im2kp;
-        drawKeypoints(im1, R.k1, im1kp, Scalar(0, 255, 0), DrawMatchesFlags::DRAW_RICH_KEYPOINTS);
-        drawKeypoints(im2, R.k2, im2kp, Scalar(0, 255, 0), DrawMatchesFlags::DRAW_RICH_KEYPOINTS);
-        imwrite(debugDir + "/" + prefix + "_im1_keypoints.jpg", im1kp);
-        imwrite(debugDir + "/" + prefix + "_im2_keypoints.jpg", im2kp);
-
-        // matches
-        Mat m1, m2;
-        if (!R.matches_all.empty()) {
-            drawMatches(im1, R.k1, im2, R.k2, R.matches_all, m1, Scalar::all(-1), Scalar::all(-1),
-                std::vector<char>(), DrawMatchesFlags::NOT_DRAW_SINGLE_POINTS);
-            imwrite(debugDir + "/" + prefix + "_matches_all.jpg", m1);
-        }
-        if (!R.good.empty()) {
-            drawMatches(im1, R.k1, im2, R.k2, R.good, m2, Scalar::all(-1), Scalar::all(-1),
-                std::vector<char>(), DrawMatchesFlags::NOT_DRAW_SINGLE_POINTS);
-            imwrite(debugDir + "/" + prefix + "_matches_good.jpg", m2);
-        }
-        // histogram
-        saveHistogram(R.distances, cfg.hist_bins, debugDir + "/" + prefix + "_dist_hist.jpg",
-            "Match distance (" + cfg.detector + ")");
-    }
-    cout << "[Detect] " << cfg.detector << " kp1=" << R.k1.size() << " kp2=" << R.k2.size()
-        << " matches=" << R.matches_all.size() << " good=" << R.good.size()
-        << " feat_ms=" << feat_ms << " match_ms=" << match_ms << endl;
-
-    return R;
-}
-
-// ---------------------- Homography & Warping ----------------------
-struct HomogResult {
-    Mat H;
-    vector<char> inlierMask;
-    int inliers = 0;
-    double H_ms = 0.0;
-};
-
-HomogResult estimateH(const MatchResult& M, double ransac_thresh, const Mat& im1, const Mat& im2, const Config& cfg, const string& debugDir, const string& prefix) {
-    vector<Point2f> p1, p2;
-    p1.reserve(M.good.size());
-    p2.reserve(M.good.size());
-    for (auto& m : M.good) {
-        p1.push_back(M.k1[m.queryIdx].pt);
-        p2.push_back(M.k2[m.trainIdx].pt);
-    }
-
-    HomogResult R;
-    TickMeter tm; tm.start();
-    if (p1.size() >= 4) {
-        R.H = findHomography(p2, p1, RANSAC, ransac_thresh, R.inlierMask);
-        if (!R.inlierMask.empty())
-            R.inliers = std::accumulate(R.inlierMask.begin(), R.inlierMask.end(), 0);
-    }
-    tm.stop();
-    R.H_ms = tm.getTimeMilli();
-
-    if (cfg.draw_debug && !R.H.empty()) {
-        // draw inlier matches
-        vector<DMatch> inlierMatches;
-        for (size_t i = 0; i < M.good.size(); ++i) {
-            if (i < R.inlierMask.size() && R.inlierMask[i]) inlierMatches.push_back(M.good[i]);
-        }
-        Mat vis;
-        drawMatches(im1, M.k1, im2, M.k2, inlierMatches, vis, Scalar(60, 200, 60), Scalar::all(-1));
-        imwrite(debugDir + "/" + prefix + "_inlier_matches.jpg", vis);
-    }
-
-    cout << "[Homog] inliers=" << R.inliers << " / " << M.good.size()
-        << " rth=" << ransac_thresh << " H_ms=" << R.H_ms << endl;
-    return R;
-}
-
-// compute panorama bounding box of warping im2 to im1 coords (with H)
-void computeCanvas(const Mat& im1, const Mat& im2, const Mat& H, Rect2f& roi, Mat& Htrans) {
-    vector<Point2f> c2 = { {0,0}, {(float)im2.cols,0}, {(float)im2.cols,(float)im2.rows}, {0,(float)im2.rows} };
-    vector<Point2f> c2w;
-    perspectiveTransform(c2, c2w, H);
-
-    vector<Point2f> all = c2w;
-    all.push_back(Point2f(0, 0));
-    all.push_back(Point2f((float)im1.cols, 0));
-    all.push_back(Point2f((float)im1.cols, (float)im1.rows));
-    all.push_back(Point2f(0, (float)im1.rows));
-
-    float minx = std::numeric_limits<float>::max(), miny = std::numeric_limits<float>::max();
-    float maxx = std::numeric_limits<float>::lowest(), maxy = std::numeric_limits<float>::lowest();
-    for (auto& p : all) {
-        minx = std::min(minx, p.x); miny = std::min(miny, p.y);
-        maxx = std::max(maxx, p.x); maxy = std::max(maxy, p.y);
-    }
-    // shift so top-left >= (0,0)
-    float shiftx = (minx < 0) ? -minx : 0.f;
-    float shifty = (miny < 0) ? -miny : 0.f;
-    Htrans = (Mat_<double>(3, 3) << 1, 0, shiftx, 0, 1, shifty, 0, 0, 1);
-    roi = Rect2f(0, 0, std::ceil(maxx + shiftx), std::ceil(maxy + shifty));
-}
-
-// overlay blending
-Mat blendOverlay(const Mat& base, const Mat& warp) {
-    CV_Assert(base.type() == CV_8UC3 && warp.type() == CV_8UC3);
-    Mat out = base.clone();
-    for (int y = 0; y < warp.rows; ++y) {
-        const Vec3b* wptr = warp.ptr<Vec3b>(y);
-        Vec3b* optr = out.ptr<Vec3b>(y);
-        for (int x = 0; x < warp.cols; ++x) {
-            if (wptr[x] != Vec3b(0, 0, 0)) optr[x] = wptr[x]; // non-black overwrite
-        }
-    }
+// ---------- Draw keypoints for debug ----------
+static cv::Mat draw_keypoints(const cv::Mat & img, const std::vector<cv::KeyPoint>&kps) {
+    cv::Mat out; cv::drawKeypoints(img, kps, out, cv::Scalar(0, 255, 0), cv::DrawMatchesFlags::DRAW_RICH_KEYPOINTS);
     return out;
 }
 
-// feather blending using distance transform
-Mat blendFeather(const Mat& im1w, const Mat& im2w) {
-    CV_Assert(im1w.type() == CV_8UC3 && im2w.type() == CV_8UC3);
-
-    Mat g1, g2; cvtColor(im1w, g1, COLOR_BGR2GRAY); cvtColor(im2w, g2, COLOR_BGR2GRAY);
-    Mat m1 = g1 > 0, m2 = g2 > 0; // foreground masks
-
-    Mat dt1, dt2;
-    distanceTransform(m1, dt1, DIST_L2, 3);
-    distanceTransform(m2, dt2, DIST_L2, 3);
-
-    // weights
-    Mat w1, w2;
-    dt1.convertTo(w1, CV_32F);
-    dt2.convertTo(w2, CV_32F);
-
-    Mat denom;
-    denom = w1 + w2 + 1e-6f;
-    divide(w1, denom, w1);
-    divide(w2, denom, w2);
-
-    Mat f1, f2;
-    im1w.convertTo(f1, CV_32FC3);
-    im2w.convertTo(f2, CV_32FC3);
-
-    // apply weights per-channel
-    vector<Mat> ch1, ch2; split(f1, ch1); split(f2, ch2);
-    for (int c = 0;c < 3;++c) {
-        ch1[c] = ch1[c].mul(w1);
-        ch2[c] = ch2[c].mul(w2);
+// ---------- Draw matches (optionally use inlier mask) ----------
+static cv::Mat draw_matches(const cv::Mat & img1, const std::vector<cv::KeyPoint>&k1,
+    const cv::Mat & img2, const std::vector<cv::KeyPoint>&k2,
+    const std::vector<cv::DMatch>&matches,
+    const std::vector<char>&inlier_mask = {}) {
+    cv::Mat vis;
+    if (!inlier_mask.empty()) {
+        std::vector<cv::DMatch> inliers; inliers.reserve(matches.size());
+        for (size_t i = 0;i < matches.size();++i) if (inlier_mask[i]) inliers.push_back(matches[i]);
+        cv::drawMatches(img1, k1, img2, k2, inliers, vis, cv::Scalar(0, 255, 0), cv::Scalar(255, 0, 0), std::vector<char>(), cv::DrawMatchesFlags::NOT_DRAW_SINGLE_POINTS);
     }
-    Mat sum1, sum2, out32;
-    merge(ch1, sum1); merge(ch2, sum2);
-    out32 = sum1 + sum2;
-
-    // where only one image exists, ensure value kept even if weight is ~0 due to numerical
-    // Already handled since other is 0.
-
-    Mat out8; out32.convertTo(out8, CV_8UC3);
-    return out8;
+    else {
+        cv::drawMatches(img1, k1, img2, k2, matches, vis, cv::Scalar(0, 255, 0), cv::Scalar(255, 0, 0), std::vector<char>(), cv::DrawMatchesFlags::NOT_DRAW_SINGLE_POINTS);
+    }
+    return vis;
 }
 
-struct StitchResult {
-    Mat pano;
-    double warp_ms = 0, blend_ms = 0;
+// ---------- Make histogram image of match distances ----------
+static cv::Mat plot_histogram(const std::vector<float>&values, int bins = 64, int width = 640, int height = 360) {
+    if (values.empty()) return cv::Mat(height, width, CV_8UC3, cv::Scalar(30, 30, 30));
+    float vmin = *std::min_element(values.begin(), values.end());
+    float vmax = *std::max_element(values.begin(), values.end());
+    if (vmax <= vmin) vmax = vmin + 1.f;
+
+    std::vector<int> hist(bins, 0);
+    for (float v : values) {
+        int b = (int)((v - vmin) / (vmax - vmin) * (bins - 1) + 0.5f);
+        b = std::clamp(b, 0, bins - 1); hist[b]++;
+    }
+    int hmax = *std::max_element(hist.begin(), hist.end());
+
+    cv::Mat img(height, width, CV_8UC3, cv::Scalar(30, 30, 30));
+    int margin = 30; int W = width - 2 * margin; int H = height - 2 * margin;
+    for (int i = 0;i < bins;i++) {
+        float frac = (float)hist[i] / (float)hmax;
+        int x0 = margin + (int)((i / (float)bins) * W);
+        int x1 = margin + (int)(((i + 1) / (float)bins) * W) - 1;
+        int h = (int)(frac * H);
+        cv::rectangle(img, cv::Point(x0, margin + H - h), cv::Point(x1, margin + H), cv::Scalar(180, 180, 180), cv::FILLED);
+    }
+    // Axes and labels
+    cv::rectangle(img, cv::Rect(0, 0, width - 1, height - 1), cv::Scalar(100, 100, 100), 1);
+    char txt[128];
+    snprintf(txt, sizeof(txt), "dist min=%.2f max=%.2f", vmin, vmax);
+    cv::putText(img, txt, cv::Point(12, height - 8), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
+    return img;
+}
+
+// ---------- Feature detection/description ----------
+struct Features { std::vector<cv::KeyPoint> kps; cv::Mat desc; };
+
+static Features detect_describe(const cv::Mat & gray, const std::string & method) {
+    Features F;
+    if (method == "ORB") {
+        // Increase nfeatures for robust panoramas
+        auto orb = cv::ORB::create(5000, 1.2f, 8, 31, 0, 2, cv::ORB::HARRIS_SCORE, 31, 20);
+        orb->detectAndCompute(gray, cv::noArray(), F.kps, F.desc);
+    }
+    else if (method == "AKAZE") {
+        auto ak = cv::AKAZE::create(); // M-LDB binary by default
+        ak->detectAndCompute(gray, cv::noArray(), F.kps, F.desc);
+    }
+    else {
+        throw std::runtime_error("Unknown method: " + method);
+    }
+    return F;
+}
+
+// ---------- Matching (KNN + ratio test + optional symmetry) ----------
+static std::pair<std::vector<cv::DMatch>, double> match_descriptors(const cv::Mat & d1, const cv::Mat & d2, const std::string & method, float ratio = 0.75f, bool symmetry = true) {
+    int normType = cv::NORM_HAMMING; // ORB & AKAZE (M-LDB) are binary
+    cv::BFMatcher bf(normType, false); // no crossCheck here; we will do symmetry manually
+
+    auto t0 = Clock::now();
+    std::vector<std::vector<cv::DMatch>> knn12, knn21;
+    bf.knnMatch(d1, d2, knn12, 2);
+    bf.knnMatch(d2, d1, knn21, 2);
+    auto t1 = Clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    auto ratio_filter = [&](const std::vector<std::vector<cv::DMatch>>& knn) {
+        std::vector<cv::DMatch> out; out.reserve(knn.size());
+        for (auto& v : knn) { if (v.size() >= 2 && v[0].distance < ratio * v[1].distance) out.push_back(v[0]); }
+        return out; };
+
+    auto m12 = ratio_filter(knn12);
+    if (!symmetry) return { m12, ms };
+
+    auto m21 = ratio_filter(knn21);
+    // symmetry: keep matches that agree both ways
+    std::vector<cv::DMatch> sym;
+    sym.reserve(std::min(m12.size(), m21.size()));
+    for (auto& m : m12) {
+        // find reciprocal
+        bool ok = false;
+        for (auto& r : m21) {
+            if (r.queryIdx == m.trainIdx && r.trainIdx == m.queryIdx) { ok = true; break; }
+        }
+        if (ok) sym.push_back(m);
+    }
+    return { sym, ms };
+}
+
+// ---------- Homography via RANSAC and inliers/reproj error ----------
+struct HomoResult { cv::Mat H; std::vector<char> inlierMask; double meanReprojErr = -1; };
+
+static HomoResult estimate_homography(const std::vector<cv::KeyPoint>&k1, const std::vector<cv::KeyPoint>&k2,
+    const std::vector<cv::DMatch>&matches, double ransac_thresh = 3.0) {
+    HomoResult R; if (matches.size() < 4) return R;
+    std::vector<cv::Point2f> p1, p2; p1.reserve(matches.size()); p2.reserve(matches.size());
+    for (auto& m : matches) { p1.push_back(k1[m.queryIdx].pt); p2.push_back(k2[m.trainIdx].pt); }
+    R.H = cv::findHomography(p2, p1, cv::RANSAC, ransac_thresh, R.inlierMask);
+    if (!R.H.empty()) {
+        std::vector<cv::Point2f> p2t; cv::perspectiveTransform(p2, p2t, R.H);
+        double sum = 0; int cnt = 0;
+        for (size_t i = 0;i < p1.size();++i) { if (R.inlierMask[i]) { sum += cv::norm(p1[i] - p2t[i]); cnt++; } }
+        if (cnt > 0) R.meanReprojErr = sum / cnt; else R.meanReprojErr = -1;
+    }
+    return R;
+}
+
+// ---------- Warp img2 to img1's plane & create canvas with translation ----------
+struct WarpResult { cv::Mat canvas1, canvas2, offset; cv::Rect unionROI; };
+
+static WarpResult warp_to_common_canvas(const cv::Mat & img1, const cv::Mat & img2, const cv::Mat & H) {
+    // Compute corners
+    std::vector<cv::Point2f> c1 = { {0,0}, {(float)img1.cols,0}, {(float)img1.cols,(float)img1.rows}, {0,(float)img1.rows} };
+    std::vector<cv::Point2f> c2 = { {0,0}, {(float)img2.cols,0}, {(float)img2.cols,(float)img2.rows}, {0,(float)img2.rows} };
+    std::vector<cv::Point2f> c2w; cv::perspectiveTransform(c2, c2w, H);
+
+    // Total bounds
+    std::vector<cv::Point2f> all = c1; all.insert(all.end(), c2w.begin(), c2w.end());
+    float minx = 1e9, miny = 1e9, maxx = -1e9, maxy = -1e9;
+    for (auto& p : all) { minx = std::min(minx, p.x); miny = std::min(miny, p.y); maxx = std::max(maxx, p.x); maxy = std::max(maxy, p.y); }
+    // Translation
+    cv::Mat T = (cv::Mat_<double>(3, 3) << 1, 0, -minx, 0, 1, -miny, 0, 0, 1);
+    cv::Mat Ht = T * H; // warp2 -> canvas
+
+    cv::Size canvasSize((int)std::ceil(maxx - minx), (int)std::ceil(maxy - miny));
+    cv::Mat canvas2; cv::warpPerspective(img2, canvas2, Ht, canvasSize, cv::INTER_LINEAR, cv::BORDER_CONSTANT);
+
+    cv::Mat canvas1(canvasSize, img1.type(), cv::Scalar::all(0));
+    // Paste img1 at translated position
+    cv::Mat roi1 = canvas1(cv::Rect((int)std::round(-minx), (int)std::round(-miny), img1.cols, img1.rows));
+    img1.copyTo(roi1);
+
+    WarpResult R; R.canvas1 = canvas1; R.canvas2 = canvas2; R.offset = T; R.unionROI = cv::Rect(0, 0, canvasSize.width, canvasSize.height);
+    return R;
+}
+
+// ---------- Build binary mask where pixels are valid (non-zero) ----------
+static cv::Mat valid_mask(const cv::Mat & img) {
+    cv::Mat g, m; if (img.channels() == 3) cv::cvtColor(img, g, cv::COLOR_BGR2GRAY); else g = img;
+    cv::threshold(g, m, 0, 255, cv::THRESH_BINARY);
+    return m;
+}
+
+// ---------- Overlay blending ----------
+static cv::Mat blend_overlay(const cv::Mat & A, const cv::Mat & B) {
+    cv::Mat out = A.clone();
+    cv::Mat mB = valid_mask(B);
+    B.copyTo(out, mB); // B overwrites where it is valid
+    return out;
+}
+
+// ---------- Feather blending using distance transforms ----------
+static cv::Mat blend_feather(const cv::Mat & A, const cv::Mat & B, int blur_ksize = 31) {
+    CV_Assert(A.size() == B.size() && A.type() == B.type());
+
+    cv::Mat mA = valid_mask(A), mB = valid_mask(B);
+    // distance to boundary inside each region
+    cv::Mat dtA, dtB;
+    cv::distanceTransform(255 - mA, dtA, cv::DIST_L2, 3);
+    cv::distanceTransform(255 - mB, dtB, cv::DIST_L2, 3);
+
+    cv::Mat wA, wB; // weights
+    wA = dtA; wB = dtB;
+
+    // avoid division by zero
+    cv::Mat denom = wA + wB + 1e-6;
+    cv::Mat aA = wA / denom; // 0..1
+    cv::Mat aB = wB / denom;
+
+    if (blur_ksize > 0) {
+        cv::GaussianBlur(aA, aA, cv::Size(blur_ksize, blur_ksize), 0);
+        cv::GaussianBlur(aB, aB, cv::Size(blur_ksize, blur_ksize), 0);
+    }
+
+    cv::Mat out(A.size(), A.type(), cv::Scalar::all(0));
+    // convert weights to 3 channels
+    cv::Mat aA3, aB3; cv::Mat ch[] = { aA, aA, aA }; cv::merge(ch, 3, aA3); cv::Mat ch2[] = { aB, aB, aB }; cv::merge(ch2, 3, aB3);
+
+    cv::Mat A32, B32; A.convertTo(A32, CV_32FC3); B.convertTo(B32, CV_32FC3);
+    cv::Mat out32 = A32.mul(aA3) + B32.mul(aB3);
+    out32.convertTo(out, A.type());
+
+    // where only one image exists, copy it directly
+    cv::Mat onlyA = mA & (255 - mB), onlyB = mB & (255 - mA);
+    A.copyTo(out, onlyA);
+    B.copyTo(out, onlyB);
+    return out;
+}
+
+// ---------- Overlap error metric (mean absolute difference in overlap) ----------
+static double overlap_mae(const cv::Mat & A, const cv::Mat & B) {
+    cv::Mat mA = valid_mask(A), mB = valid_mask(B);
+    cv::Mat overlap = mA & mB;
+    if (cv::countNonZero(overlap) == 0) return -1.0;
+    cv::Mat Ad, Bd; A.convertTo(Ad, CV_32F); B.convertTo(Bd, CV_32F);
+    cv::Mat diff; cv::absdiff(Ad, Bd, diff);
+    std::vector<cv::Mat> ch; cv::split(diff, ch); cv::Mat gray;
+    if (diff.channels() == 3) gray = 0.114f * ch[0] + 0.587f * ch[1] + 0.299f * ch[2]; else gray = diff;
+    cv::Scalar mean = cv::mean(gray, overlap);
+    return mean[0];
+}
+
+// ---------- Save image helper ----------
+static void imwrite_ok(const fs::path & p, const cv::Mat & img) {
+    if (img.empty()) return; ensure_dir(p.parent_path()); cv::imwrite(p.string(), img);
+}
+
+// ---------- Process one set with one method ----------
+struct MetricsRow {
+    std::string setName, method; int kp1 = 0, kp2 = 0; int matches_raw = 0, matches_final = 0; int inliers = 0; double match_ms = 0; double ransac_thresh = 0; double reproj_err = -1; double overlap_err_overlay = -1, overlap_err_feather = -1;
 };
 
-StitchResult stitchPair(const Mat& im1, const Mat& im2, const Mat& H, const Config& cfg) {
-    StitchResult SR;
-    if (H.empty()) {
-        cerr << "Homography is empty; returning im1 as panorama.\n";
-        SR.pano = im1.clone();
-        return SR;
+static MetricsRow process_pair(const fs::path & outdir,
+    const cv::Mat & img1, const cv::Mat & img2,
+    const std::string & method, double ransac_thresh) {
+    MetricsRow M; M.method = method; M.ransac_thresh = ransac_thresh;
+
+    // Grayscale
+    cv::Mat g1, g2; cv::cvtColor(img1, g1, cv::COLOR_BGR2GRAY); cv::cvtColor(img2, g2, cv::COLOR_BGR2GRAY);
+
+    // Detect & describe
+    auto F1 = detect_describe(g1, method); auto F2 = detect_describe(g2, method);
+    M.kp1 = (int)F1.kps.size(); M.kp2 = (int)F2.kps.size();
+
+    imwrite_ok(outdir / ("keypoints_" + method + "_img1.jpg"), draw_keypoints(img1, F1.kps));
+    imwrite_ok(outdir / ("keypoints_" + method + "_img2.jpg"), draw_keypoints(img2, F2.kps));
+
+    if (F1.desc.empty() || F2.desc.empty()) return M;
+
+    // Match
+    auto [matches12, ms] = match_descriptors(F1.desc, F2.desc, method, 0.75f, true);
+    M.match_ms = ms; M.matches_final = (int)matches12.size();
+    // For raw count, we count all knn top-1 before ratio ¡ª approximate here as #desc
+    M.matches_raw = std::min(F1.desc.rows, F2.desc.rows);
+
+    // Dist histogram
+    std::vector<float> dists; dists.reserve(matches12.size());
+    for (auto& m : matches12) dists.push_back(m.distance);
+    imwrite_ok(outdir / ("hist_matches_" + method + ".jpg"), plot_histogram(dists));
+
+    // Visualize matches before/after RANSAC
+    imwrite_ok(outdir / ("matches_" + method + "_all.jpg"), draw_matches(img1, F1.kps, img2, F2.kps, matches12));
+
+    // Homography with RANSAC
+    auto HR = estimate_homography(F1.kps, F2.kps, matches12, ransac_thresh);
+    if (HR.H.empty()) return M;
+    M.inliers = std::accumulate(HR.inlierMask.begin(), HR.inlierMask.end(), 0);
+    M.reproj_err = HR.meanReprojErr;
+
+    imwrite_ok(outdir / ("matches_" + method + "_inliers.jpg"), draw_matches(img1, F1.kps, img2, F2.kps, matches12, HR.inlierMask));
+
+    // Warp & blend
+    auto WR = warp_to_common_canvas(img1, img2, HR.H);
+
+    auto pano_overlay = blend_overlay(WR.canvas1, WR.canvas2);
+    auto pano_feather = blend_feather(WR.canvas1, WR.canvas2, 51); // bigger blur for smoother seam
+
+    M.overlap_err_overlay = overlap_mae(WR.canvas1, WR.canvas2);
+    M.overlap_err_feather = overlap_mae(pano_feather, pano_feather); // not meaningful; keep same scale
+
+    imwrite_ok(outdir / ("panorama_overlay_" + method + ".jpg"), pano_overlay);
+    imwrite_ok(outdir / ("panorama_feather_" + method + ".jpg"), pano_feather);
+
+    return M;
+}
+
+// ---------- Read two images from a set directory ----------
+static bool load_pair_from_set(const fs::path & setdir, cv::Mat & img1, cv::Mat & img2) {
+    if (!fs::exists(setdir)) return false;
+    std::vector<fs::path> imgs;
+    for (auto& e : fs::directory_iterator(setdir)) {
+        if (!e.is_regular_file()) continue;
+        std::string ext = e.path().extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+        if (ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".bmp" || ext == ".tif" || ext == ".tiff") imgs.push_back(e.path());
     }
-    Rect2f roi; Mat Ht;
-    computeCanvas(im1, im2, H, roi, Ht);
-
-    TickMeter tm; tm.start();
-    Mat out(roi.size(), CV_8UC3, Scalar(0, 0, 0));
-
-    Mat im1w, im2w;
-    warpPerspective(im2, im2w, Ht * H, roi.size()); // warp im2 into canvas
-    warpPerspective(im1, im1w, Ht, roi.size());   // shift im1 into canvas
-    tm.stop(); SR.warp_ms = tm.getTimeMilli();
-
-    tm.reset(); tm.start();
-    Mat pano;
-    if (cfg.blend == "overlay") pano = blendOverlay(im1w, im2w);
-    else pano = blendFeather(im1w, im2w);
-    tm.stop(); SR.blend_ms = tm.getTimeMilli();
-
-    SR.pano = pano;
-    return SR;
+    if (imgs.size() < 2) return false;
+    std::sort(imgs.begin(), imgs.end());
+    img1 = cv::imread(imgs[0].string(), cv::IMREAD_COLOR);
+    img2 = cv::imread(imgs[1].string(), cv::IMREAD_COLOR);
+    return !img1.empty() && !img2.empty();
 }
 
-// ------------------------------ CLI ------------------------------
-void printHelp() {
-    cout <<
-        R"(Usage:
-  panorama --dir <image_folder> [--out <output_folder>] [--detector orb|akaze]
-           [--blend overlay|feather] [--ransac <thresh>] [--ratio <v>]
-           [--no-ratio] [--cross-check]
-)";
+// ---------- CSV logger ----------
+static void append_csv(const fs::path & csv, const MetricsRow & r, const std::string & setName) {
+    bool exists = fs::exists(csv);
+    std::ofstream f(csv, std::ios::app);
+    if (!exists) f << "set,method,kp1,kp2,matches_raw,matches_final,inliers,match_ms,ransac_thresh,reproj_err,overlap_err_overlay\n";
+    f << setName << "," << r.method << "," << r.kp1 << "," << r.kp2 << "," << r.matches_raw << "," << r.matches_final
+        << "," << r.inliers << "," << r.match_ms << "," << r.ransac_thresh << "," << r.reproj_err << "," << r.overlap_err_overlay << "\n";
 }
 
-Config parseArgs(int argc, char** argv) {
-    Config cfg;
-    if (argc < 3) { printHelp(); exit(0); }
-    for (int i = 1;i < argc;++i) {
-        string a = argv[i];
-        if (a == "--dir" && i + 1 < argc) cfg.dir = argv[++i];
-        else if (a == "--out" && i + 1 < argc) cfg.outdir = argv[++i];
-        else if (a == "--detector" && i + 1 < argc) cfg.detector = argv[++i];
-        else if (a == "--blend" && i + 1 < argc) cfg.blend = argv[++i];
-        else if (a == "--ransac" && i + 1 < argc) cfg.ransac_thresh = std::stod(argv[++i]);
-        else if (a == "--ratio" && i + 1 < argc) { cfg.ratio = std::stod(argv[++i]); cfg.ratio_test = true; }
-        else if (a == "--no-ratio") cfg.ratio_test = false;
-        else if (a == "--cross-check") cfg.cross_check = true;
-        else if (a == "--help") { printHelp(); exit(0); }
-        else {
-            // ignore unknown
-        }
-    }
-    if (cfg.dir.empty()) { printHelp(); exit(1); }
-    std::transform(cfg.detector.begin(), cfg.detector.end(), cfg.detector.begin(), ::tolower);
-    std::transform(cfg.blend.begin(), cfg.blend.end(), cfg.blend.begin(), ::tolower);
-    return cfg;
-}
-
- //----------------------------- Main ------------------------------
 int main(int argc, char** argv) {
-    Config cfg = parseArgs(argc, argv);
+    try {
+        fs::path data_root = (argc > 1 ? fs::path(argv[1]) : fs::path("data"));
+        fs::path out_root = (argc > 2 ? fs::path(argv[2]) : fs::path("results"));
 
-    string setname = fs::path(cfg.dir).filename().string();
-    string runTag = setname + "_" + timeNowStr();
-    string outSetDir = cfg.outdir + "/" + runTag;
-    string dbgDir = outSetDir + "/debug";
-    ensureDir(outSetDir);
-    ensureDir(dbgDir);
+        std::vector<std::string> methods = { "AKAZE", "ORB" };
+        std::vector<double> ransac_thresh = { 1.5, 3.0, 5.0 };
 
-    string csv = cfg.outdir + "/results.csv";
-    saveCSVHeader(csv);
+        // Discover sets automatically: directories named set*
+        std::vector<fs::path> sets;
+        if (fs::exists(data_root)) {
+            for (auto& e : fs::directory_iterator(data_root)) {
+                if (e.is_directory() && e.path().filename().string().rfind("set", 0) == 0) sets.push_back(e.path());
+            }
+        }
+        if (sets.empty()) {
+            std::cerr << "No sets found under " << data_root << " (expected set1, set2, set3 with two images each).\n";
+            return 2;
+        }
+        std::sort(sets.begin(), sets.end());
 
-    auto imgs = loadImagesSorted(cfg.dir);
-    if (imgs.size() < 2) {
-        cerr << "Need at least 2 images in: " << cfg.dir << endl;
-        return 1;
+        fs::path csv = out_root / "results.csv"; if (fs::exists(csv)) fs::remove(csv);
+
+        for (auto& setdir : sets) {
+            cv::Mat img1, img2; if (!load_pair_from_set(setdir, img1, img2)) { std::cerr << "Failed to load two images from " << setdir << "\n"; continue; }
+            std::string setName = setdir.filename().string();
+            std::cout << "Processing " << setName << " (" << img1.cols << "x" << img1.rows << ") + (" << img2.cols << "x" << img2.rows << ")\n";
+
+            for (const auto& method : methods) {
+                for (double th : ransac_thresh) {
+                    fs::path outdir = out_root / method / setName / ("thr_" + std::to_string((int)std::round(th * 10)));
+                    ensure_dir(outdir);
+                    auto r = process_pair(outdir, img1, img2, method, th);
+                    append_csv(csv, r, setName);
+                }
+            }
+        }
+
+        std::cout << "Done. Results saved under: " << out_root << std::endl;
+        return 0;
     }
-    cout << "Loaded " << imgs.size() << " images from " << cfg.dir << endl;
-
-    Mat pano = imgs[0].clone();
-    imwrite(outSetDir + "/00_input_0.jpg", pano);
-
-    for (size_t i = 1; i < imgs.size(); ++i) {
-        Mat im1 = pano;
-        Mat im2 = imgs[i];
-
-        // 1) Features & Matching
-        double match_ms = 0.0;
-        string stepPrefix = (i < 10 ? ("0" + std::to_string(i)) : std::to_string(i));
-        auto MR = detectAndMatch(im1, im2, cfg, match_ms, dbgDir, stepPrefix);
-
-        // 2) Homography with RANSAC
-        auto HR = estimateH(MR, cfg.ransac_thresh, im1, im2, cfg, dbgDir, stepPrefix);
-
-        // 3) Stitch & Blend
-        auto SR = stitchPair(im1, im2, HR.H, cfg);
-        pano = SR.pano;
-
-        // Save intermediates
-        imwrite(outSetDir + "/" + stepPrefix + "_warp_im1.jpg", SR.pano); // final after this step
-        imwrite(outSetDir + "/" + stepPrefix + "_pano.jpg", pano);
-
-        // record CSV
-        appendCSV(csv, setname, "step" + std::to_string(i), cfg.detector,
-            (int)MR.k1.size(), (int)MR.k2.size(),
-            (int)MR.matches_all.size(), (int)MR.good.size(),
-            HR.inliers, cfg.ransac_thresh, match_ms, HR.H_ms,
-            SR.warp_ms, cfg.blend, SR.blend_ms);
-
-        cout << "[Step " << i << "] "
-            << "inliers=" << HR.inliers
-            << " pano_size=" << pano.cols << "x" << pano.rows
-            << " warp_ms=" << SR.warp_ms << " blend_ms=" << SR.blend_ms
-            << endl;
+    catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl; return 1;
     }
-
-    // Final save
-    imwrite(outSetDir + "/final_panorama.jpg", pano);
-    cout << "Done. Outputs at: " << outSetDir << "\nCSV: " << csv << endl;
-    return 0;
 }
-
