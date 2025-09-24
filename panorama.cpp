@@ -184,79 +184,41 @@ static cv::Mat blend_overlay(const cv::Mat & A, const cv::Mat & B) {
     return out;
 }
 
-// ---------- Feather blending using distance transforms ----------
-//static cv::Mat blend_feather(const cv::Mat & A, const cv::Mat & B, int blur_ksize = 31) {
-//    CV_Assert(A.size() == B.size() && A.type() == B.type());
-//
-//    cv::Mat mA = valid_mask(A), mB = valid_mask(B);
-//    // distance to boundary inside each region
-//    cv::Mat dtA, dtB;
-//    cv::distanceTransform(255 - mA, dtA, cv::DIST_L2, 3);
-//    cv::distanceTransform(255 - mB, dtB, cv::DIST_L2, 3);
-//
-//    cv::Mat wA, wB; // weights
-//    wA = dtA; wB = dtB;
-//
-//    // avoid division by zero
-//    cv::Mat denom = wA + wB + 1e-6;
-//    cv::Mat aA = wA / denom; // 0..1
-//    cv::Mat aB = wB / denom;
-//
-//    if (blur_ksize > 0) {
-//        cv::GaussianBlur(aA, aA, cv::Size(blur_ksize, blur_ksize), 0);
-//        cv::GaussianBlur(aB, aB, cv::Size(blur_ksize, blur_ksize), 0);
-//    }
-//
-//    cv::Mat out(A.size(), A.type(), cv::Scalar::all(0));
-//    // convert weights to 3 channels
-//    cv::Mat aA3, aB3; cv::Mat ch[] = { aA, aA, aA }; cv::merge(ch, 3, aA3); cv::Mat ch2[] = { aB, aB, aB }; cv::merge(ch2, 3, aB3);
-//
-//    cv::Mat A32, B32; A.convertTo(A32, CV_32FC3); B.convertTo(B32, CV_32FC3);
-//    cv::Mat out32 = A32.mul(aA3) + B32.mul(aB3);
-//    out32.convertTo(out, A.type());
-//
-//    // where only one image exists, copy it directly
-//    cv::Mat onlyA = mA & (255 - mB), onlyB = mB & (255 - mA);
-//    A.copyTo(out, onlyA);
-//    B.copyTo(out, onlyB);
-//    return out;
-////}
 
 // ---------- Feather blending using distance transforms  ----------
 static cv::Mat blend_feather(const cv::Mat& A, const cv::Mat& B, int blur_ksize = 31) {
     CV_Assert(A.size() == B.size() && A.type() == B.type());
 
-    // 1) 有效掩膜（前景=255，背景=0）
+    // Valid masks
     cv::Mat mA = valid_mask(A), mB = valid_mask(B);
 
-    // 2) 只在各自前景内部做“到背景(0)的距离”——即到边界的距离
-    // distanceTransform 的定义：对非零区域计算到 0 像素的距离
-    cv::Mat dtA, dtB; // float32
+    // Compute distance transform inside the foreground region
+    cv::Mat dtA, dtB; 
     cv::distanceTransform(mA, dtA, cv::DIST_L2, 3);
     cv::distanceTransform(mB, dtB, cv::DIST_L2, 3);
 
-    // 3) 非前景处权重清零，避免泄露
+    // Clear weights outside the valid region
     dtA.setTo(0, mA == 0);
     dtB.setTo(0, mB == 0);
 
-    // 4) 归一化到 [0,1]（可选，但更稳定）
+    // Normalization
     double maxA, maxB; cv::minMaxLoc(dtA, nullptr, &maxA); cv::minMaxLoc(dtB, nullptr, &maxB);
     if (maxA > 0) dtA /= (float)maxA;
     if (maxB > 0) dtB /= (float)maxB;
 
-    // 5) 在重叠区做 wA/(wA+wB) 与 wB/(wA+wB) 的加权
+    // Compute weights in the overlap
     cv::Mat denom = dtA + dtB;
     cv::Mat aA, aB;
     cv::divide(dtA, denom + 1e-6f, aA);
     cv::divide(dtB, denom + 1e-6f, aB);
 
-    // 可选：轻微模糊让接缝更柔和
+    // blur weights for smoother seam
     if (blur_ksize > 0) {
         cv::GaussianBlur(aA, aA, cv::Size(blur_ksize, blur_ksize), 0);
         cv::GaussianBlur(aB, aB, cv::Size(blur_ksize, blur_ksize), 0);
     }
 
-    // 6) 融合
+    // Weighted combination
     cv::Mat A32, B32; A.convertTo(A32, CV_32FC3); B.convertTo(B32, CV_32FC3);
     cv::Mat aA3, aB3; cv::Mat chA[] = { aA, aA, aA }; cv::merge(chA, 3, aA3);
     cv::Mat chB[] = { aB, aB, aB }; cv::merge(chB, 3, aB3);
@@ -264,7 +226,7 @@ static cv::Mat blend_feather(const cv::Mat& A, const cv::Mat& B, int blur_ksize 
     cv::Mat out32 = A32.mul(aA3) + B32.mul(aB3);
     cv::Mat out; out32.convertTo(out, A.type());
 
-    // 7) 在各自独占区域直接拷贝，避免空洞
+
     cv::Mat onlyA = mA & (255 - mB), onlyB = mB & (255 - mA);
     A.copyTo(out, onlyA);
     B.copyTo(out, onlyB);
@@ -385,7 +347,7 @@ int main(int argc, char** argv) {
         std::vector<std::string> methods = { "AKAZE", "ORB" };
         std::vector<double> ransac_thresh = { 1.5, 3.0, 5.0 };
 
-        // Discover sets automatically: directories named set*
+        // Discover sets automatically: directories named set
         std::vector<fs::path> sets;
         if (fs::exists(data_root)) {
             for (auto& e : fs::directory_iterator(data_root)) {
